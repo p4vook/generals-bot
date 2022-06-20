@@ -206,14 +206,6 @@ struct Field {
         }
 };
 
-struct PathGeneratorState {
-        std::mt19937 rnd;
-        std::deque<CellI> cur;
-        std::unordered_set<CellI> used;
-        unsigned units;
-        unsigned iterations = 0;
-};
-
 struct State {
         unsigned player_count;
         unsigned player_id;
@@ -333,17 +325,22 @@ struct State {
                 return std::nullopt;
         }
 
-        std::deque<CellI> gen_path(PathGeneratorState &state) const
+        struct PathGeneratorState {
+                std::mt19937 rnd;
+                std::deque<CellI> cur;
+                std::unordered_set<CellI> used;
+                unsigned units;
+                unsigned iterations = 0;
+        };
+
+        template <class ExitCondition, class ComparePaths>
+        std::deque<CellI> gen_path(PathGeneratorState &state, ExitCondition &exit, ComparePaths &comp) const
         {
                 ++state.iterations;
                 std::deque<CellI> res = state.cur;
-                if (state.units == 0 || state.cur.size() > 12 || state.iterations > 10000) {
+                if (state.units == 0 || exit(state)) {
                         return res;
                 }
-
-                auto cmp_res = [&](const std::deque<CellI> &x, const std::deque<CellI> &y) -> bool {
-                        return count_path_res(x) < count_path_res(y);
-                };
 
                 state.used.insert(state.cur.back());
                 auto neighbors = field.neighbors(state.cur.back());
@@ -353,8 +350,8 @@ struct State {
                         if (c && state.units > (unsigned) std::max(0, *c) && state.used.find(cand) == state.used.end() && c) {
                                 state.cur.push_back(cand);
                                 state.units -= *c;
-                                auto next_res = gen_path(state);
-                                if (cmp_res(next_res, res)) {
+                                auto next_res = gen_path(state, exit, comp);
+                                if (comp(next_res, res)) {
                                         res = std::move(next_res);
                                 }
                                 state.units += *c;
@@ -387,6 +384,13 @@ struct State {
                 if (greedy_path.size() < 2 && capital[player_id].second <= 10) {
                         return Skip{};
                 } else {
+                        auto cmp_res = [&](const std::deque<CellI> &x, const std::deque<CellI> &y) -> bool {
+                                return count_path_res(x) < count_path_res(y);
+                        };
+                        auto exit_condition = [](const PathGeneratorState &s) -> bool {
+                                return s.cur.size() >= 10 || s.iterations > 5000;
+                        };
+
                         CellI begin;
                         std::deque<CellI> prev_path;
                         if (greedy_path.empty() || my_units(greedy_path.front()) <= 1) {
@@ -403,7 +407,7 @@ struct State {
                                         s.iterations = 0;
                                         s.units      = my_units(s.cur.back()) - 1;
                                         s.rnd.seed(std::random_device{}());
-                                        prev_path = gen_path(s);
+                                        prev_path = gen_path(s, exit_condition, cmp_res);
                                 }
                         }
 
@@ -413,7 +417,7 @@ struct State {
                                 s.iterations = 0;
                                 s.units = my_units(s.cur.back()) - 1;
                                 s.rnd.seed(std::random_device{}());
-                                greedy_path = gen_path(s);
+                                greedy_path = gen_path(s, exit_condition, cmp_res);
                         }
 
                         if (count_path_res(prev_path) < count_path_res(greedy_path)) {
@@ -436,7 +440,6 @@ struct State {
 
         Turn trahat() const {
         }
-
 
         void check(const Turn &a) const
         {
