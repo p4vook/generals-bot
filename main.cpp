@@ -1,5 +1,3 @@
-#pragma GCC optimize("Ofast,no-stack-protector")
-
 #include <bits/stdc++.h>
 
 struct PlayerInfo {
@@ -141,6 +139,27 @@ std::ostream &operator<<(std::ostream &out, const Turn &x)
         return out;
 }
 
+std::optional<Armed> get_armed(const Cell &c) {
+        if (!std::holds_alternative<Visible>(c)) {
+                return std::nullopt;
+        }
+        const auto &v = std::get<Visible>(c);
+        if (!std::holds_alternative<Armed>(v)) {
+                return std::nullopt;
+        }
+        return std::get<Armed>(v);
+}
+
+bool can_pass(const Cell &c) {
+        if (std::holds_alternative<Hidden>(c)) {
+                return std::get<Hidden>(c) == Hidden::Empty;
+        } else if (std::holds_alternative<Visible>(c)) {
+                return std::holds_alternative<Armed>(std::get<Visible>(c));
+        } else {
+                return false;
+        }
+}
+
 struct Field {
         unsigned size_x;
         unsigned size_y;
@@ -216,35 +235,33 @@ struct State {
         unsigned turn_num;
 
         std::unordered_map<unsigned, std::pair<CellI, unsigned>> capital;
-        std::deque<CellI> greedy_path;
-
+        bool exists_not_me = false;
         std::mt19937 rnd;
 
         State(unsigned x, unsigned y, unsigned _count, unsigned _id)
             : player_count(_count), player_id(_id), field(x, y),
               info(_count + 1), turn_num(0)
         {
+                rnd.seed(57444179);
                 if (player_id > player_count) {
                         throw std::runtime_error("Invalid player id");
                 }
         }
 
-        void update_capitals()
+        void update_info()
         {
                 for (unsigned x = 0; x < field.size_x; ++x) {
                         for (unsigned y = 0; y < field.size_y; ++y) {
-                                auto &cell = field.at({x, y});
-                                if (!std::holds_alternative<Visible>(cell)) {
+                                const auto &armed = get_armed(field.at({x, y}));
+                                if (!armed) {
                                         continue;
                                 }
-                                const auto &vis = std::get<Visible>(cell);
-                                if (!std::holds_alternative<Armed>(vis)) {
-                                        continue;
+                                if (armed->type == ArmyType::Capital) {
+                                        capital[armed->army.owner] = {
+                                            {x, y}, armed->army.size};
                                 }
-                                const auto &armed = std::get<Armed>(vis);
-                                if (armed.type == ArmyType::Capital) {
-                                        capital[armed.army.owner] = {
-                                            {x, y}, armed.army.size};
+                                if (armed && armed->army.owner != player_id && armed->army.owner != 0) {
+                                        exists_not_me = true;
                                 }
                         }
                 }
@@ -258,47 +275,9 @@ struct State {
                 }
 
                 field.read_table(in);
-                update_capitals();
+                update_info();
         }
 
-        struct PathRes {
-                unsigned size;
-                unsigned dist_sum;
-
-                bool operator<(const PathRes &other) const {
-                        return size > other.size || (size == other.size && dist_sum < other.dist_sum);
-                }
-        };
-
-        PathRes count_path_res(const std::deque<CellI> &x) const {
-                auto dist = [&](const CellI &pos) -> unsigned {
-                        return field.dist(pos, capital.find(player_id)->second.first);
-                };
-
-                auto filter = [&](const CellI &pos) -> bool {
-                        const auto &c = field.at(pos);
-                        if (std::holds_alternative<Hidden>(c)) {
-                                return true;
-                        }
-                        if (std::holds_alternative<Visible>(c)) {
-                                const auto &v = std::get<Visible>(c);
-                                return (std::holds_alternative<Armed>(v) &&
-                                        std::get<Armed>(v).army.owner !=
-                                            player_id);
-                        }
-                        return false;
-                };
-
-                unsigned size_x = 0;
-                unsigned sum_dist = 0;
-
-                for (const auto &tmp : x) {
-                        size_x += filter(tmp);
-                        sum_dist += dist(tmp);
-                }
-
-                return {size_x, sum_dist};
-        }
 
         std::optional<int> capture_cost(const CellI &pos) const {
                 const auto &c = field.at(pos);
@@ -331,6 +310,7 @@ struct State {
                 std::unordered_set<CellI> used;
                 unsigned units;
                 unsigned iterations = 0;
+                unsigned depth;
         };
 
         template <class ExitCondition, class ComparePaths>
@@ -347,13 +327,15 @@ struct State {
                 std::shuffle(neighbors.begin(), neighbors.end(), state.rnd);
                 for (const auto &cand : neighbors) {
                         auto c = capture_cost(cand);
-                        if (c && state.units > (unsigned) std::max(0, *c) && state.used.find(cand) == state.used.end() && c) {
+                        if (c && state.units > (unsigned) std::max(0, *c) && state.used.find(cand) == state.used.end()) {
                                 state.cur.push_back(cand);
                                 state.units -= *c;
+                                ++state.depth;
                                 auto next_res = gen_path(state, exit, comp);
                                 if (comp(next_res, res)) {
                                         res = std::move(next_res);
                                 }
+                                --state.depth;
                                 state.units += *c;
                                 state.cur.pop_back();
                         }
@@ -379,22 +361,81 @@ struct State {
                 }
         }
 
+        std::vector<CellI> my_cells() const {
+                std::vector<CellI> res;
+                for (unsigned x = 0; x < field.size_x; ++x) {
+                        for (unsigned y = 0; y < field.size_y; ++y) {
+                                unsigned units = my_units({x, y});
+                                if (units > 0) {
+                                        res.push_back({x, y});
+                                }
+                        }
+                }
+                return res;
+        }
+
+        struct PathCaptureMetric {
+                unsigned size;
+                unsigned dist_sum;
+
+                bool operator<(const PathCaptureMetric &other) const {
+                        return size > other.size || (size == other.size && dist_sum < other.dist_sum);
+                }
+        };
+
+        PathCaptureMetric path_capture_metric(const std::deque<CellI> &x) const {
+                auto dist = [&](const CellI &pos) -> unsigned {
+                        return field.dist(pos, capital.find(player_id)->second.first);
+                };
+
+                auto filter = [&](const CellI &pos) -> bool {
+                        const auto &c = field.at(pos);
+                        if (std::holds_alternative<Hidden>(c)) {
+                                return true;
+                        }
+                        if (std::holds_alternative<Visible>(c)) {
+                                const auto &v = std::get<Visible>(c);
+                                return (std::holds_alternative<Armed>(v) &&
+                                        std::get<Armed>(v).army.owner !=
+                                            player_id);
+                        }
+                        return false;
+                };
+
+                unsigned size_x = 0;
+                unsigned sum_dist = 0;
+
+                for (const auto &tmp : x) {
+                        size_x += filter(tmp);
+                        sum_dist += dist(tmp);
+                }
+
+                return {size_x, sum_dist};
+        }
+
+        std::deque<CellI> greedy_path;
+
         Turn greedy_start()
         {
-                if (greedy_path.size() < 2 && capital[player_id].second <= 10) {
+                if (greedy_path.size() < 2 && (turn_num < 400 && capital[player_id].second <= 10)) {
                         return Skip{};
                 } else {
                         auto cmp_res = [&](const std::deque<CellI> &x, const std::deque<CellI> &y) -> bool {
-                                return count_path_res(x) < count_path_res(y);
+                                return path_capture_metric(x) < path_capture_metric(y);
                         };
                         auto exit_condition = [](const PathGeneratorState &s) -> bool {
-                                return s.cur.size() >= 10 || s.iterations > 5000;
+                                return s.depth >= 10 || s.iterations > 1000;
                         };
 
                         CellI begin;
                         std::deque<CellI> prev_path;
                         if (greedy_path.empty() || my_units(greedy_path.front()) <= 1) {
-                                begin = capital[player_id].first;
+                                if (turn_num >= 400) {
+                                        std::vector<CellI> cells = my_cells();
+                                        begin = cells[rnd() % (unsigned) cells.size()];
+                                } else {
+                                        begin = capital[player_id].first;
+                                }
                         } else {
                                 begin = greedy_path.front();
 
@@ -405,8 +446,9 @@ struct State {
                                                 s.used.insert(CellI);
                                         }
                                         s.iterations = 0;
+                                        s.depth = 0;
                                         s.units      = my_units(s.cur.back()) - 1;
-                                        s.rnd.seed(std::random_device{}());
+                                        s.rnd.seed(rnd());
                                         prev_path = gen_path(s, exit_condition, cmp_res);
                                 }
                         }
@@ -415,14 +457,16 @@ struct State {
                                 PathGeneratorState s;
                                 s.cur = {begin};
                                 s.iterations = 0;
+                                s.depth = 0;
                                 s.units = my_units(s.cur.back()) - 1;
-                                s.rnd.seed(std::random_device{}());
+                                s.rnd.seed(rnd());
                                 greedy_path = gen_path(s, exit_condition, cmp_res);
                         }
 
-                        if (count_path_res(prev_path) < count_path_res(greedy_path)) {
+                        if (prev_path.size() >= 2 && path_capture_metric(prev_path) < path_capture_metric(greedy_path)) {
                                 greedy_path = std::move(prev_path);
                         }
+
                         if (greedy_path.size() < 2) {
                                 throw std::logic_error("Failed to build path");
                         }
@@ -438,7 +482,161 @@ struct State {
                 }
         }
 
-        Turn trahat() const {
+        struct PathCollectMetric {
+                int collected;
+                int dist;
+
+                bool operator<(const PathCollectMetric &other) {
+                        return collected > other.collected || (collected == other.collected && dist < other.dist);
+                }
+        };
+
+        PathCollectMetric path_collect_metric(const std::deque<CellI> &path) const {
+                int cur_collected = 0;
+                int cur_dist = 0;
+                for (const auto &pos : path) {
+                        cur_collected -= *capture_cost(pos);
+                        cur_dist = field.dist(pos, capital.find(player_id)->second.first);
+                }
+                return {cur_collected, cur_dist};
+        };
+
+        std::deque<CellI> collect_path;
+        unsigned collected_len;
+
+        std::deque<CellI> attack_path;
+
+        Turn trahat() {
+                CellI src = collect_path.front();
+                if (my_units(src) == 0) {
+                        collected_len = 0;
+                        collect_path.clear();
+                }
+
+//                std::cerr << "Attacking from " << src.first << " " << src.second << std::endl;
+
+                std::queue<CellI> q;
+                std::unordered_map<CellI, CellI> prev;
+                std::unordered_map<CellI, int> dist;
+                dist[src] = 0;
+                prev[src] = src;
+                q.push(src);
+                while (!q.empty())  {
+                        auto v = q.front();
+                        q.pop();
+
+                        for (const auto &u : field.neighbors(v)) {
+                                if (can_pass(field.at(u)) && (dist.find(u) == dist.end() || dist[u] > dist[v] + 1)) {
+                                        dist[u] = dist[v] + 1;
+                                        q.push(u);
+                                        prev[u] = v;
+                                }
+                        }
+                }
+
+                std::optional<CellI> nearest;
+                for (unsigned x = 0; x < field.size_x; ++x) {
+                        for (unsigned y = 0; y < field.size_y; ++y) {
+                                const auto &armed = get_armed(field.at({x, y}));
+                                if (((!exists_not_me && (!armed || armed->army.owner != player_id)) || (armed && armed->army.owner != player_id && armed->army.owner != 0)) && dist.find({x, y}) != dist.end()) {
+                                        if (!nearest || dist[{x, y}] < dist[*nearest]) {
+                                                nearest = {x, y};
+                                        }
+                                }
+                        }
+                }
+                for (const auto &[id, cap] : capital) {
+                        if (id != player_id && dist.find(cap.first) != dist.end()) {
+                                nearest = cap.first;
+                        }
+                }
+
+                if (!nearest) {
+                        collected_len = 0;
+                        collect_path.clear();
+                        return Skip{};
+                } else {
+                        assert(dist.find(*nearest) != dist.end());
+                        CellI cur_pos = *nearest;
+                        while (prev[cur_pos] != src) {
+                                cur_pos = prev[cur_pos];
+                        }
+                        collect_path = {cur_pos};
+                        return Move{MoveType::All, src, cur_pos};
+                }
+        }
+
+        Turn midgame() {
+                unsigned collect_len = std::min((unsigned)my_cells().size() / 2, field.size_x * field.size_y / 40);
+                if (collected_len + 1 == collect_len) {
+                        return trahat();
+                } else {
+                        auto cmp_res = [&](const std::deque<CellI> &x, const std::deque<CellI> &y) -> bool {
+                                return path_collect_metric(x) < path_collect_metric(y);
+                        };
+                        auto exit_condition = [&](const PathGeneratorState &s) -> bool {
+                                return s.depth >= 10 || s.cur.size() >= collect_len - collected_len;
+                        };
+
+                        CellI begin;
+                        std::deque<CellI> prev_path;
+                        if (collect_path.empty() || my_units(collect_path.front()) == 0) {
+                                collected_len = 0;
+                                std::vector<CellI> cells = my_cells();
+                                sort(cells.begin(), cells.end(), [&](const CellI &a, const CellI &b) {
+                                                return my_units(a) > my_units(b);
+                                });
+                                begin = cells[rnd() % std::min(30u, (unsigned)cells.size())];
+                        } else {
+                                begin = collect_path.front();
+
+                                {
+                                        PathGeneratorState s;
+                                        s.cur = std::move(collect_path);
+                                        for (const auto &CellI : s.cur) {
+                                                s.used.insert(CellI);
+                                        }
+                                        s.iterations = 0;
+                                        s.depth = 0;
+                                        s.units      = std::max(0, path_collect_metric(s.cur).collected);
+                                        s.rnd.seed(rnd());
+                                        prev_path = gen_path(s, exit_condition, cmp_res);
+                                }
+                        }
+
+                        {
+                                PathGeneratorState s;
+                                s.cur = {begin};
+                                s.used = {};
+                                s.iterations = 0;
+                                s.depth = 0;
+                                s.units = my_units(s.cur.back()) - 1;
+                                s.rnd.seed(rnd());
+                                collect_path = gen_path(s, exit_condition, cmp_res);
+                        }
+
+                        if (prev_path.size() >= 2 && path_collect_metric(prev_path) < path_collect_metric(collect_path)) {
+                                collect_path = std::move(prev_path);
+                        }
+
+                        if (collect_path.size() < 2) {
+                                collect_path.clear();
+                                collected_len = 0;
+                                throw std::logic_error("Failed to build path");
+                        }
+
+                        CellI cur = collect_path.front();
+                        ++collected_len;
+                        collect_path.pop_front();
+                        
+                        auto c = capture_cost(collect_path.front());
+                        if (c && (unsigned) std::max(*c, 0) > my_units(cur)) {
+                                throw std::logic_error("Tried to capture uncapturable");
+                        }
+
+                        return Move{MoveType::All, cur, collect_path.front()};
+                }
+                return Skip{};
         }
 
         void check(const Turn &a) const
@@ -462,12 +660,13 @@ struct State {
                 }
         }
 
+        
         Turn do_turn()
         {
-                if (turn_num <= 300) {
+                if (field.size_x * field.size_y <= 50 && (turn_num <= 2 * field.size_x * field.size_y && !exists_not_me)) {
                         return greedy_start();
                 } else {
-                        return Skip{};
+                        return midgame();
                 }
         }
 };
@@ -481,7 +680,7 @@ struct Interactor {
                 unsigned n, m, k, id;
                 std::cin >> n >> m >> k >> id;
 
-                State state(n, m, k, id);
+                State state(m, n, k, id);
 
                 while (true) {
                         int is_ok;
